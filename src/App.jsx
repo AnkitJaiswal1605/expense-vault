@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import storage from "./storage";
+import { supabase } from "./supabase";
 
 const CATEGORIES = [
   { value: "food", label: "Food", icon: "🍽", color: "#E8A838" },
@@ -9,14 +9,6 @@ const CATEGORIES = [
 ];
 
 const categoryMap = Object.fromEntries(CATEGORIES.map((c) => [c.value, c]));
-
-function hashPassword(pw) {
-  let h = 0;
-  for (let i = 0; i < pw.length; i++) {
-    h = (Math.imul(31, h) + pw.charCodeAt(i)) | 0;
-  }
-  return String(h);
-}
 
 function formatCurrency(n) {
   return new Intl.NumberFormat("en-IN", {
@@ -28,7 +20,7 @@ function formatCurrency(n) {
 }
 
 function formatDate(d) {
-  return new Date(d).toLocaleDateString("en-IN", {
+  return new Date(d + "T00:00:00").toLocaleDateString("en-IN", {
     day: "numeric",
     month: "short",
     year: "numeric",
@@ -56,47 +48,28 @@ function AuthScreen({ onLogin }) {
     }
     setLoading(true);
     try {
-      const userKey = `user:${email.toLowerCase().trim()}`;
       if (mode === "signup") {
-        try {
-          const existing = await storage.get(userKey);
-          if (existing) {
-            setError("An account with this email already exists.");
-            setLoading(false);
-            return;
-          }
-        } catch {}
-        const userData = {
-          name: name.trim(),
-          email: email.toLowerCase().trim(),
-          passwordHash: hashPassword(password),
-          createdAt: new Date().toISOString(),
-        };
-        await storage.set(userKey, JSON.stringify(userData));
-        await storage.set(`expenses:${userData.email}`, JSON.stringify([]));
-        onLogin(userData);
+        const { data, error: signUpErr } = await supabase.auth.signUp({
+          email: email.trim(),
+          password,
+          options: { data: { full_name: name.trim() } },
+        });
+        if (signUpErr) throw signUpErr;
+        if (data.user) {
+          onLogin(data.user);
+        }
       } else {
-        let userData;
-        try {
-          const res = await storage.get(userKey);
-          userData = res ? JSON.parse(res.value) : null;
-        } catch {
-          userData = null;
+        const { data, error: signInErr } = await supabase.auth.signInWithPassword({
+          email: email.trim(),
+          password,
+        });
+        if (signInErr) throw signInErr;
+        if (data.user) {
+          onLogin(data.user);
         }
-        if (!userData) {
-          setError("No account found. Please sign up first.");
-          setLoading(false);
-          return;
-        }
-        if (userData.passwordHash !== hashPassword(password)) {
-          setError("Incorrect password.");
-          setLoading(false);
-          return;
-        }
-        onLogin(userData);
       }
     } catch (err) {
-      setError("Something went wrong. Please try again.");
+      setError(err.message || "Something went wrong. Please try again.");
     }
     setLoading(false);
   };
@@ -184,25 +157,25 @@ function Dashboard({ user, onLogout }) {
   const [formError, setFormError] = useState("");
   const [filterCat, setFilterCat] = useState("all");
   const [deletingId, setDeletingId] = useState(null);
+  const [saving, setSaving] = useState(false);
 
-  const storageKey = `expenses:${user.email}`;
+  const displayName =
+    user.user_metadata?.full_name ||
+    user.email?.split("@")[0] ||
+    "User";
 
   const loadExpenses = useCallback(async () => {
-    try {
-      const res = await storage.get(storageKey);
-      if (res) setExpenses(JSON.parse(res.value));
-    } catch {}
+    const { data, error } = await supabase
+      .from("expenses")
+      .select("*")
+      .eq("user_id", user.id)
+      .order("date", { ascending: false });
+
+    if (!error && data) setExpenses(data);
     setLoaded(true);
-  }, [storageKey]);
+  }, [user.id]);
 
   useEffect(() => { loadExpenses(); }, [loadExpenses]);
-
-  const saveExpenses = async (updated) => {
-    setExpenses(updated);
-    try {
-      await storage.set(storageKey, JSON.stringify(updated));
-    } catch {}
-  };
 
   const handleAdd = async () => {
     setFormError("");
@@ -211,35 +184,52 @@ function Dashboard({ user, onLogout }) {
       setFormError("Enter a valid amount.");
       return;
     }
-    const newExpense = {
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      name: formData.name.trim(),
-      amount: Number(formData.amount),
-      category: formData.category,
-      date: formData.date,
-      createdAt: new Date().toISOString(),
-    };
-    await saveExpenses([newExpense, ...expenses]);
+    setSaving(true);
+    const { data, error } = await supabase
+      .from("expenses")
+      .insert({
+        user_id: user.id,
+        name: formData.name.trim(),
+        amount: Number(formData.amount),
+        category: formData.category,
+        date: formData.date,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      setFormError(error.message);
+      setSaving(false);
+      return;
+    }
+
+    setExpenses((prev) => [data, ...prev].sort((a, b) => b.date.localeCompare(a.date)));
     setFormData({ name: "", amount: "", category: "food", date: new Date().toISOString().split("T")[0] });
     setShowForm(false);
+    setSaving(false);
   };
 
   const handleDelete = async (id) => {
     setDeletingId(id);
-    setTimeout(async () => {
-      await saveExpenses(expenses.filter((e) => e.id !== id));
+    const { error } = await supabase.from("expenses").delete().eq("id", id);
+    setTimeout(() => {
+      if (!error) setExpenses((prev) => prev.filter((e) => e.id !== id));
       setDeletingId(null);
     }, 300);
   };
 
-  const filtered = filterCat === "all" ? expenses : expenses.filter((e) => e.category === filterCat);
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    onLogout();
+  };
 
-  const totalAll = expenses.reduce((s, e) => s + e.amount, 0);
-  const totalFiltered = filtered.reduce((s, e) => s + e.amount, 0);
+  const filtered = filterCat === "all" ? expenses : expenses.filter((e) => e.category === filterCat);
+  const totalAll = expenses.reduce((s, e) => s + Number(e.amount), 0);
+  const totalFiltered = filtered.reduce((s, e) => s + Number(e.amount), 0);
 
   const catTotals = CATEGORIES.map((c) => ({
     ...c,
-    total: expenses.filter((e) => e.category === c.value).reduce((s, e) => s + e.amount, 0),
+    total: expenses.filter((e) => e.category === c.value).reduce((s, e) => s + Number(e.amount), 0),
   }));
 
   if (!loaded) {
@@ -252,15 +242,14 @@ function Dashboard({ user, onLogout }) {
 
   return (
     <div style={styles.dashboard}>
-      {/* Header */}
       <header style={styles.header}>
         <div style={styles.headerLeft}>
           <span style={styles.headerLogo}>◈</span>
           <span style={styles.headerTitle}>ExpenseVault</span>
         </div>
         <div style={styles.headerRight}>
-          <span style={styles.userName}>{user.name}</span>
-          <button style={styles.logoutBtn} onClick={onLogout}>Sign Out</button>
+          <span style={styles.userName}>{displayName}</span>
+          <button style={styles.logoutBtn} onClick={handleLogout}>Sign Out</button>
         </div>
       </header>
 
@@ -355,8 +344,8 @@ function Dashboard({ user, onLogout }) {
               </div>
             </div>
             {formError && <p style={styles.error}>{formError}</p>}
-            <button style={styles.primaryBtn} onClick={handleAdd}>
-              Save Expense
+            <button style={styles.primaryBtn} onClick={handleAdd} disabled={saving}>
+              {saving ? "Saving..." : "Save Expense"}
             </button>
           </div>
         )}
@@ -410,7 +399,7 @@ function Dashboard({ user, onLogout }) {
                       </p>
                     </div>
                     <div style={styles.expenseRight}>
-                      <p style={styles.expenseAmount}>{formatCurrency(exp.amount)}</p>
+                      <p style={styles.expenseAmount}>{formatCurrency(Number(exp.amount))}</p>
                       <button
                         style={styles.deleteBtn}
                         onClick={() => handleDelete(exp.id)}
@@ -436,24 +425,23 @@ export default function App() {
   const [checking, setChecking] = useState(true);
 
   useEffect(() => {
-    (async () => {
-      try {
-        const sess = await storage.get("session");
-        if (sess) setUser(JSON.parse(sess.value));
-      } catch {}
+    // Check existing session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
       setChecking(false);
-    })();
+    });
+
+    // Listen for auth changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (_event, session) => {
+        setUser(session?.user ?? null);
+      }
+    );
+
+    return () => subscription.unsubscribe();
   }, []);
 
-  const handleLogin = async (userData) => {
-    setUser(userData);
-    try { await storage.set("session", JSON.stringify(userData)); } catch {}
-  };
-
-  const handleLogout = async () => {
-    setUser(null);
-    try { await storage.delete("session"); } catch {}
-  };
+  const handleLogout = () => setUser(null);
 
   if (checking) {
     return <div style={styles.loadingWrap}><div style={styles.spinner} /></div>;
@@ -462,7 +450,7 @@ export default function App() {
   return user ? (
     <Dashboard user={user} onLogout={handleLogout} />
   ) : (
-    <AuthScreen onLogin={handleLogin} />
+    <AuthScreen onLogin={setUser} />
   );
 }
 
@@ -480,7 +468,6 @@ const textMuted = "#5C5C78";
 const danger = "#EF4444";
 
 const styles = {
-  /* Auth */
   authContainer: {
     minHeight: "100vh",
     background: `linear-gradient(160deg, ${bg0} 0%, #0C0C18 50%, #100E1A 100%)`,
@@ -538,10 +525,7 @@ const styles = {
     borderRadius: 8,
     transition: "all 0.2s",
   },
-  tabActive: {
-    background: bg3,
-    color: textPrimary,
-  },
+  tabActive: { background: bg3, color: textPrimary },
   fieldGroup: { marginBottom: 16 },
   label: {
     display: "block",
@@ -586,8 +570,6 @@ const styles = {
     letterSpacing: "0.3px",
     transition: "filter 0.2s",
   },
-
-  /* Dashboard */
   dashboard: {
     minHeight: "100vh",
     background: `linear-gradient(180deg, ${bg0} 0%, #0C0C18 100%)`,
@@ -621,14 +603,7 @@ const styles = {
     cursor: "pointer",
     transition: "all 0.2s",
   },
-
-  content: {
-    maxWidth: 800,
-    margin: "0 auto",
-    padding: "24px 20px 60px",
-  },
-
-  /* Summary */
+  content: { maxWidth: 800, margin: "0 auto", padding: "24px 20px 60px" },
   summaryRow: {
     display: "grid",
     gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
@@ -653,15 +628,8 @@ const styles = {
     letterSpacing: "0.6px",
     margin: 0,
   },
-  summaryValue: {
-    fontSize: 24,
-    fontWeight: 700,
-    color: textPrimary,
-    margin: "6px 0 0",
-  },
+  summaryValue: { fontSize: 24, fontWeight: 700, color: textPrimary, margin: "6px 0 0" },
   summaryMeta: { fontSize: 12, color: textMuted, margin: "4px 0 0" },
-
-  /* Action Bar */
   actionBar: {
     display: "flex",
     justifyContent: "space-between",
@@ -682,11 +650,7 @@ const styles = {
     cursor: "pointer",
     transition: "all 0.2s",
   },
-  filterChipActive: {
-    background: `${gold}22`,
-    borderColor: gold,
-    color: gold,
-  },
+  filterChipActive: { background: `${gold}22`, borderColor: gold, color: gold },
   addBtn: {
     padding: "9px 20px",
     borderRadius: 10,
@@ -699,8 +663,6 @@ const styles = {
     transition: "filter 0.2s",
     whiteSpace: "nowrap",
   },
-
-  /* Form */
   formCard: {
     background: bg2,
     border: `1px solid ${border}`,
@@ -708,19 +670,12 @@ const styles = {
     padding: 24,
     marginBottom: 20,
   },
-  formTitle: {
-    fontSize: 16,
-    fontWeight: 700,
-    color: textPrimary,
-    margin: "0 0 18px",
-  },
+  formTitle: { fontSize: 16, fontWeight: 700, color: textPrimary, margin: "0 0 18px" },
   formGrid: {
     display: "grid",
     gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
     gap: 14,
   },
-
-  /* List */
   listArea: {},
   listHeader: {
     display: "flex",
@@ -761,24 +716,13 @@ const styles = {
     whiteSpace: "nowrap",
   },
   expenseMeta: { fontSize: 12, color: textMuted, margin: "3px 0 0" },
-  expenseRight: {
-    display: "flex",
-    alignItems: "center",
-    gap: 12,
-    flexShrink: 0,
-  },
-  expenseAmount: {
-    fontSize: 15,
-    fontWeight: 700,
-    color: textPrimary,
-    margin: 0,
-    whiteSpace: "nowrap",
-  },
+  expenseRight: { display: "flex", alignItems: "center", gap: 12, flexShrink: 0 },
+  expenseAmount: { fontSize: 15, fontWeight: 700, color: textPrimary, margin: 0, whiteSpace: "nowrap" },
   deleteBtn: {
     width: 30,
     height: 30,
     borderRadius: 8,
-    border: `1px solid transparent`,
+    border: "1px solid transparent",
     background: "transparent",
     color: textMuted,
     fontSize: 13,
@@ -788,27 +732,9 @@ const styles = {
     justifyContent: "center",
     transition: "all 0.2s",
   },
-
-  /* Empty */
-  emptyState: {
-    textAlign: "center",
-    padding: "60px 20px",
-  },
-  emptyIcon: {
-    fontSize: 48,
-    color: textMuted,
-    marginBottom: 16,
-    opacity: 0.4,
-  },
-  emptyText: {
-    fontSize: 14,
-    color: textMuted,
-    maxWidth: 280,
-    margin: "0 auto",
-    lineHeight: 1.6,
-  },
-
-  /* Loading */
+  emptyState: { textAlign: "center", padding: "60px 20px" },
+  emptyIcon: { fontSize: 48, color: textMuted, marginBottom: 16, opacity: 0.4 },
+  emptyText: { fontSize: 14, color: textMuted, maxWidth: 280, margin: "0 auto", lineHeight: 1.6 },
   loadingWrap: {
     minHeight: "100vh",
     background: bg0,
@@ -826,7 +752,6 @@ const styles = {
   },
 };
 
-// Inject keyframes globally
 if (typeof document !== "undefined" && !document.getElementById("ev-keyframes")) {
   const styleEl = document.createElement("style");
   styleEl.id = "ev-keyframes";
@@ -834,7 +759,6 @@ if (typeof document !== "undefined" && !document.getElementById("ev-keyframes"))
     @keyframes spin { to { transform: rotate(360deg); } }
     input:focus, select:focus { border-color: ${gold} !important; }
     button:hover { filter: brightness(1.1); }
-    .deleteBtn:hover { background: ${danger}22 !important; color: ${danger} !important; border-color: ${danger}44 !important; }
     select option { background: ${bg0}; color: ${textPrimary}; }
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
